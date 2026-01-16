@@ -1,0 +1,217 @@
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/skbuff.h>
+#include <linux/inet.h>
+#include <linux/ip.h>
+#include <linux/udp.h>
+#include <linux/can.h>
+#include <linux/can/raw.h>
+#include <linux/socket.h>
+#include <net/sock.h>
+#include <linux/kthread.h>
+#include <linux/netdevice.h>
+#include <linux/string.h>
+#include <linux/sched.h>
+#include <linux/delay.h>
+#include <uapi/linux/in.h>
+
+static char *can_interface_name = "can0";
+module_param(can_interface_name, charp, 0644);
+
+static int remote_port = 12345;
+module_param(remote_port, int, 0644);
+
+static struct socket *can_sock;
+static struct socket *udp_sock;
+static struct task_struct *rx_thread;
+static int thread_running = 0;
+
+struct can_eth_packet {
+    __be32 can_id;
+    __u8 can_dlc;
+    __u8 flags;
+    __u8 data[CAN_MAX_DLEN];
+} __packed;
+
+static int send_can_frame_over_udp(struct can_frame *frame)
+{
+    struct msghdr msg;
+    struct kvec iov;
+    struct sockaddr_in addr;
+    struct can_eth_packet packet;
+    int err;
+    __be32 ip_addr;
+
+    if (!udp_sock) {
+        return -ENOTCONN;
+    }
+
+    packet.can_id = cpu_to_be32(frame->can_id);
+    packet.can_dlc = frame->can_dlc;
+    packet.flags = 0;
+    if (frame->can_id & CAN_RTR_FLAG)
+        packet.flags |= 0x01;
+    if (frame->can_id & CAN_EFF_FLAG)
+        packet.flags |= 0x02;
+    
+    memcpy(packet.data, frame->data, frame->can_dlc);
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(remote_port);
+    addr.sin_addr.s_addr = ip_addr;
+
+    iov.iov_base = &packet;
+    iov.iov_len = sizeof(packet.can_id) + sizeof(packet.can_dlc) + 
+                  sizeof(packet.flags) + frame->can_dlc;
+
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_name = &addr;
+    msg.msg_namelen = sizeof(addr);
+    msg.msg_flags = 0;
+
+    err = kernel_sendmsg(udp_sock, &msg, &iov, 1, iov.iov_len);
+
+    return err;
+}
+
+static int can_rx_thread(void *data)
+{
+    struct msghdr msg;
+    struct kvec iov;
+    struct can_frame frame;
+    int err;
+    struct sockaddr_can addr;
+    int len = sizeof(addr);
+
+    while (!kthread_should_stop() && thread_running) {
+        iov.iov_base = &frame;
+        iov.iov_len = sizeof(frame);
+
+        memset(&msg, 0, sizeof(msg));
+        msg.msg_name = &addr;
+        msg.msg_namelen = len;
+        msg.msg_flags = MSG_DONTWAIT;
+
+        err = kernel_recvmsg(can_sock, &msg, &iov, 1, iov.iov_len, msg.msg_flags);
+
+        if (err > 0) {
+            send_can_frame_over_udp(&frame);
+        } else if (err != -EAGAIN && err != -EWOULDBLOCK) {
+            msleep(100);
+        } else {
+            msleep(10);
+        }
+    }
+
+    return 0;
+}
+
+static int init_can_socket(void)
+{
+    struct sockaddr_can addr;
+    struct can_filter filter = {0, 0};
+    struct net_device *can_dev;
+    int err;
+    sockptr_t optval;
+
+    err = sock_create_kern(&init_net, PF_CAN, SOCK_RAW, CAN_RAW, &can_sock);
+    if (err < 0) {
+        return err;
+    }
+
+    can_dev = dev_get_by_name(&init_net, can_interface_name);
+    if (!can_dev) {
+        sock_release(can_sock);
+        can_sock = NULL;
+        return -ENODEV;
+    }
+
+    addr.can_family = AF_CAN;
+    addr.can_ifindex = can_dev->ifindex;
+
+    optval = KERNEL_SOCKPTR(&filter);
+    err = sock_setsockopt(can_sock, SOL_CAN_RAW, CAN_RAW_FILTER, optval, sizeof(filter));
+    if (err < 0) {
+        dev_put(can_dev);
+        sock_release(can_sock);
+        can_sock = NULL;
+        return err;
+    }
+
+    err = kernel_bind(can_sock, (struct sockaddr *)&addr, sizeof(addr));
+    dev_put(can_dev);
+
+    if (err < 0) {
+        sock_release(can_sock);
+        can_sock = NULL;
+        return err;
+    }
+
+    return 0;
+}
+
+static int init_udp_socket(void)
+{
+    int err;
+
+    err = sock_create_kern(&init_net, AF_INET, SOCK_DGRAM, IPPROTO_UDP, &udp_sock);
+    if (err < 0) {
+        return err;
+    }
+
+    return 0;
+}
+
+static int __init can_ethernet_init(void)
+{
+    int err;
+
+    err = init_udp_socket();
+    if (err < 0) {
+        return err;
+    }
+
+    err = init_can_socket();
+    if (err < 0) {
+        sock_release(udp_sock);
+        udp_sock = NULL;
+        return err;
+    }
+
+    thread_running = 1;
+    rx_thread = kthread_run(can_rx_thread, NULL, "can_eth_rx");
+    if (IS_ERR(rx_thread)) {
+        sock_release(can_sock);
+        sock_release(udp_sock);
+        can_sock = NULL;
+        udp_sock = NULL;
+        thread_running = 0;
+        return PTR_ERR(rx_thread);
+    }
+
+    return 0;
+}
+
+static void __exit can_ethernet_exit(void)
+{
+    thread_running = 0;
+    if (rx_thread && !IS_ERR(rx_thread)) {
+        kthread_stop(rx_thread);
+        rx_thread = NULL;
+    }
+
+    if (can_sock) {
+        sock_release(can_sock);
+        can_sock = NULL;
+    }
+
+    if (udp_sock) {
+        sock_release(udp_sock);
+        udp_sock = NULL;
+    }
+}
+
+module_init(can_ethernet_init);
+module_exit(can_ethernet_exit);
+

@@ -1,0 +1,1 @@
+savedcmd_can_ethernet.ko := ld -r -m elf_x86_64 -z noexecstack --no-warn-rwx-segments --build-id=sha1  -T /usr/src/linux-headers-6.14.0-37-generic/scripts/module.lds -o can_ethernet.ko can_ethernet.o can_ethernet.mod.o .module-common.o

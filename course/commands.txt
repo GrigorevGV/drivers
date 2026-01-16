@@ -1,0 +1,203 @@
+# Команды для сборки и запуска драйвера CAN-Ethernet
+# Копируйте команды по мере необходимости
+
+# ============================================
+# 1. УСТАНОВКА ЗАВИСИМОСТЕЙ
+# ============================================
+
+sudo apt-get update
+sudo apt-get install build-essential linux-headers-$(uname -r) can-utils
+
+# ============================================
+# 2. СОЗДАНИЕ ВИРТУАЛЬНОГО CAN ИНТЕРФЕЙСА (для тестирования)
+# ============================================
+
+sudo modprobe vcan
+sudo ip link add dev vcan0 type vcan
+sudo ip link set up vcan0
+
+# Проверка создания интерфейса
+ip link show vcan0
+
+# ============================================
+# 3. СБОРКА МОДУЛЯ
+# ============================================
+
+# Переход в директорию проекта (если еще не в ней)
+cd /mnt/shared/drivers
+
+# Очистка предыдущих сборок
+make clean
+
+# Сборка модуля
+make
+
+# Проверка результата
+ls -lh *.ko
+
+# ============================================
+# 4. ЗАГРУЗКА МОДУЛЯ
+# ============================================
+
+# Базовый вариант (использует can0 по умолчанию, remote_ip=192.168.1.100)
+sudo insmod can_ethernet.ko
+
+# С указанием всех параметров
+sudo insmod can_ethernet.ko can_interface_name=vcan0 remote_ip=192.168.1.100 remote_port=12345
+
+# С использованием локального IP для тестирования
+sudo insmod can_ethernet.ko can_interface_name=vcan0 remote_ip=127.0.0.1 remote_port=12345
+
+# ============================================
+# 5. ПРОВЕРКА ЗАГРУЗКИ МОДУЛЯ
+# ============================================
+
+# Проверка загруженных модулей
+lsmod | grep can_ethernet
+
+# Просмотр параметров модуля
+cat /sys/module/can_ethernet/parameters/can_interface_name
+cat /sys/module/can_ethernet/parameters/remote_ip
+cat /sys/module/can_ethernet/parameters/remote_port
+
+# Просмотр логов ядра
+dmesg | tail -20
+
+# Просмотр логов в реальном времени
+sudo dmesg -w
+
+# Только логи нашего модуля
+dmesg | grep can_ethernet
+
+# ============================================
+# 6. ТЕСТИРОВАНИЕ
+# ============================================
+
+# Отправка тестового CAN сообщения
+cansend vcan0 123#DEADBEEF
+
+# Отправка расширенного CAN фрейма
+cansend vcan0 12345678#1122334455667788
+
+# Мониторинг CAN трафика
+candump vcan0
+
+# В другом терминале: прием UDP пакетов через netcat
+# Вариант 1: сохранить в файл и потом просмотреть (самый надежный)
+nc -u -l 12345 > /tmp/can_data.bin
+# После отправки CAN сообщения нажмите Ctrl+C, затем:
+hexdump -C /tmp/can_data.bin
+# Или для просмотра в реальном времени в другом терминале:
+tail -f /tmp/can_data.bin | hexdump -C
+
+# Вариант 2: через Python скрипт (работает надежно)
+python3 -c "import socket; s=socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(('', 12345)); [print(' '.join(f'{b:02x}' for b in s.recv(1024))) for _ in iter(int, 1)]"
+
+# Вариант 3: через socat (если установлен)
+socat -u UDP4-RECV:12345,fork - | hexdump -C
+
+# Вариант 4: через netcat с выводом через xxd
+nc -u -l 12345 | xxd
+
+# Примечание: если просто nc -u -l 12345 показывает данные (даже нечитаемые символы),
+# значит драйвер работает! Для просмотра в hex используйте вариант 1 или 2.
+
+# ============================================
+# 7. ВЫГРУЗКА МОДУЛЯ
+# ============================================
+
+sudo rmmod can_ethernet
+
+# Проверка выгрузки
+lsmod | grep can_ethernet
+
+# Просмотр финальных логов
+dmesg | tail -10
+
+# ============================================
+# 8. ДОПОЛНИТЕЛЬНЫЕ КОМАНДЫ
+# ============================================
+
+# Просмотр всех CAN интерфейсов
+ip link show | grep can
+
+# Проверка статуса конкретного CAN интерфейса
+ip -details link show can0
+
+# Статистика сетевых интерфейсов
+cat /proc/net/dev | grep can
+
+# Проверка версии ядра
+uname -r
+
+# Поиск заголовков ядра
+dpkg -l | grep linux-headers-$(uname -r)
+
+# Просмотр загруженных CAN модулей
+lsmod | grep can
+
+# Загрузка CAN модулей вручную (если нужно)
+sudo modprobe can
+sudo modprobe can_raw
+sudo modprobe can_dev
+sudo modprobe vcan
+
+# ============================================
+# 9. ПОЛНЫЙ СЦЕНАРИЙ ТЕСТИРОВАНИЯ
+# ============================================
+
+# Шаг 1: Установка зависимостей
+sudo apt-get update
+sudo apt-get install build-essential linux-headers-$(uname -r) can-utils netcat
+
+# Шаг 2: Создание виртуального CAN
+sudo modprobe vcan
+sudo ip link add dev vcan0 type vcan
+sudo ip link set up vcan0
+
+# Шаг 3: Сборка
+make clean
+make
+
+# Шаг 4: Загрузка модуля
+sudo insmod can_ethernet.ko can_interface_name=vcan0 remote_ip=127.0.0.1 remote_port=12345
+
+# Шаг 5: В другом терминале запустить приемник
+nc -u -l 12345
+
+# Шаг 6: Отправка тестовых сообщений
+cansend vcan0 123#DEADBEEF
+cansend vcan0 456#CAFEBABE
+cansend vcan0 789#12345678
+
+# Шаг 7: Выгрузка модуля
+sudo rmmod can_ethernet
+
+# ============================================
+# 10. РАБОТА С РЕАЛЬНЫМ CAN ИНТЕРФЕЙСОМ
+# ============================================
+
+# Если у вас есть реальный CAN адаптер (например, USB-CAN):
+
+# Загрузка драйвера адаптера (пример для USB-CAN)
+sudo modprobe can-usb
+
+# Настройка скорости и включение интерфейса
+sudo ip link set can0 type can bitrate 500000
+sudo ip link set up can0
+
+# Проверка статуса
+ip link show can0
+
+# Загрузка нашего модуля с реальным интерфейсом
+sudo insmod can_ethernet.ko can_interface_name=can0 remote_ip=192.168.1.100 remote_port=12345
+
+# ============================================
+# ПРИМЕЧАНИЯ
+# ============================================
+# - Все команды выполняются в Ubuntu (не в Windows)
+# - Путь /mnt/shared/drivers - пример, замените на ваш путь
+# - Используйте sudo для команд, требующих прав root
+# - Для остановки процесса используйте Ctrl+C
+# - При ошибках компиляции проверьте версию ядра и наличие заголовков
+
